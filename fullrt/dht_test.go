@@ -1049,7 +1049,7 @@ func TestFindPeerGraceCancelRace(t *testing.T) {
 						return nil, ctx.Err()
 					}
 				} else {
-					delay := time.Duration((i+idx)%7)*50*time.Millisecond
+					delay := time.Duration((i+idx)%7) * 50 * time.Millisecond
 					select {
 					case <-time.After(delay):
 					case <-ctx.Done():

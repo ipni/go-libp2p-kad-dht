@@ -12,12 +12,12 @@ import (
 type config struct {
 	dhtOpts []kaddht.Option
 
-	crawlInterval          time.Duration
-	waitFrac               float64
-	bulkSendParallelism    int
-	timeoutPerOp           time.Duration
-	crawler                crawler.Crawler
-	pmOpts                 []records.Option
+	crawlInterval              time.Duration
+	waitFrac                   float64
+	bulkSendParallelism        int
+	timeoutPerOp               time.Duration
+	crawler                    crawler.Crawler
+	pmOpts                     []records.Option
 	ipDiversityFilterLimit     int
 	findPeerGrace              time.Duration
 	findPeerDialTimeout        time.Duration

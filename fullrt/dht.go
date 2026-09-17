@@ -164,14 +164,14 @@ type FullRT struct {
 // bootstrap peers).
 func NewFullRT(h host.Host, protocolPrefix protocol.ID, options ...Option) (*FullRT, error) {
 	fullrtcfg := config{
-		crawlInterval:          time.Hour,
-		bulkSendParallelism:    20,
-		waitFrac:               0.3,
-		timeoutPerOp:           5 * time.Second,
-		ipDiversityFilterLimit: amino.DefaultMaxPeersPerIPGroup,
-		findPeerGrace:                defaultFindPeerGraceAfterFirstReport,
-		findPeerDialTimeout:          defaultFindPeerDialTimeout,
-		maxConcurrentFindPeerDials:   defaultMaxConcurrentFindPeerDials,
+		crawlInterval:              time.Hour,
+		bulkSendParallelism:        20,
+		waitFrac:                   0.3,
+		timeoutPerOp:               5 * time.Second,
+		ipDiversityFilterLimit:     amino.DefaultMaxPeersPerIPGroup,
+		findPeerGrace:              defaultFindPeerGraceAfterFirstReport,
+		findPeerDialTimeout:        defaultFindPeerDialTimeout,
+		maxConcurrentFindPeerDials: defaultMaxConcurrentFindPeerDials,
 	}
 	if err := fullrtcfg.apply(options...); err != nil {
 		return nil, err
@@ -277,10 +277,10 @@ func NewFullRT(h host.Host, protocolPrefix protocol.ID, options ...Option) (*Ful
 		waitFrac:     fullrtcfg.waitFrac,
 		timeoutPerOp: fullrtcfg.timeoutPerOp,
 
-		findPeerGrace:                fullrtcfg.findPeerGrace,
-		findPeerDialTimeout:          fullrtcfg.findPeerDialTimeout,
-		maxConcurrentFindPeerDials:   fullrtcfg.maxConcurrentFindPeerDials,
-		findPeerDialSlots:            make(chan struct{}, fullrtcfg.maxConcurrentFindPeerDials),
+		findPeerGrace:              fullrtcfg.findPeerGrace,
+		findPeerDialTimeout:        fullrtcfg.findPeerDialTimeout,
+		maxConcurrentFindPeerDials: fullrtcfg.maxConcurrentFindPeerDials,
+		findPeerDialSlots:          make(chan struct{}, fullrtcfg.maxConcurrentFindPeerDials),
 
 		crawlerInterval: fullrtcfg.crawlInterval,
 
@@ -1621,13 +1621,14 @@ func (dht *FullRT) FindPeer(ctx context.Context, id peer.ID) (pi peer.AddrInfo, 
 			case <-graceChan:
 				// The grace window elapsed after the first report. Cancel the query so
 				// execOnMany stops waiting on the slow peers (cancelled calls count as
-				// done), then keep draining addrsCh until it closes: a report that beat
-				// the deadline by an instant — already buffered, or in flight from a
-				// responder unblocked by the cancel — is still collected. execOnMany
-				// returns as soon as the cancelled calls complete and closes addrsCh
-				// right after, so this adds no latency. A report that lands after the
-				// deadline is dropped: its sender blocks on the full channel until the
-				// cancel unblocks it, then takes ctx.Done() and abandons the send.
+				// done), then keep draining addrsCh until it closes: addrsCh is buffered
+				// for every queried peer, so a report that beat the deadline by an
+				// instant is already sitting in the channel and is still collected.
+				// execOnMany returns as soon as the cancelled calls complete and closes
+				// addrsCh right after, so this adds no latency. A report that lands
+				// after the deadline is dropped because the cancel aborts that peer's
+				// stream: its GetClosestPeers returns an error and fn never reaches the
+				// send.
 				cancelquery()
 				graceChan = nil
 			case <-ctx.Done():
@@ -1658,11 +1659,12 @@ func (dht *FullRT) FindPeer(ctx context.Context, id peer.ID) (pi peer.AddrInfo, 
 
 		for _, a := range peers {
 			if a.ID == id {
-				select {
-				case addrsCh <- a:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
+				// addrsCh is buffered for every queried peer and each fn sends at most
+				// once, so this send can never block. It deliberately does not select on
+				// ctx.Done(): once the grace window has cancelled the query both cases
+				// would be ready at once and select would pick between them at random,
+				// dropping a report this peer had already parsed.
+				addrsCh <- a
 				return nil
 			}
 		}

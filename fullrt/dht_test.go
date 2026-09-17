@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ import (
 	kadkey "github.com/libp2p/go-libp2p-xor/key"
 	"github.com/libp2p/go-libp2p-xor/trie"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/routing"
 	ma "github.com/multiformats/go-multiaddr"
@@ -755,4 +757,566 @@ func TestFindPeerPrefersConnectedPeer(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, h2.ID(), pi.ID)
 	require.Zero(t, sends.Load(), "FindPeer must not query the network when already connected to the target")
+}
+
+// TestFindPeerCutsQueryAfterGrace verifies the early exit: once the first peer
+// reports the target, FindPeer waits only findPeerGrace (default 500 ms) for
+// the near-simultaneous reports from the other close peers and then cancels the
+// query, rather than waiting for every one of them.
+func TestFindPeerCutsQueryAfterGrace(t *testing.T) {
+	frt := newTestFullRT(t, WithTimeoutPerOperation(5*time.Second))
+
+	// The number of responders is deliberately larger than the success threshold
+	// execOnMany uses to start its own "good enough" timer (waitFrac of the peer
+	// count, 0.3 here): with a single report the heuristic must not fire, so the
+	// only thing that can cut the query is the grace window under test. With a
+	// regression the slow responders are waited on for the full 5s per-op timeout.
+	const numResponders = 8
+	frt.bucketSize = numResponders
+	responders := make([]peer.ID, numResponders)
+	for i := range responders {
+		responders[i] = newTestResponder(t)
+	}
+	setTriePeers(t, frt, responders...)
+
+	target := newTestResponder(t)
+	targetAddr, err := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/1")
+	require.NoError(t, err)
+	reported := []peer.AddrInfo{{ID: target, Addrs: []ma.Multiaddr{targetAddr}}}
+
+	// Exactly one responder reports the target and answers immediately; the rest
+	// block until the query context is cancelled.
+	frt.protoMessenger, err = dht_pb.NewProtocolMessenger(&testMessageSender{
+		sendRequest: func(ctx context.Context, p peer.ID, req *dht_pb.Message) (*dht_pb.Message, error) {
+			assert.Equal(t, dht_pb.Message_FIND_NODE, req.Type)
+			if p != responders[0] {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			resp := dht_pb.NewMessage(req.Type, req.Key, 0)
+			resp.CloserPeers = dht_pb.RawPeerInfosToPBPeers(reported)
+			return resp, nil
+		},
+	})
+	require.NoError(t, err)
+
+	start := time.Now()
+	pi, err := frt.FindPeer(t.Context(), target)
+	elapsed := time.Since(start)
+	require.NoError(t, err)
+	require.Equal(t, target, pi.ID)
+	// Fast enough to prove the slow responders were cut (a regression runs the full
+	// 5s per-op timeout); slow enough to prove it actually waited for the grace
+	// window after the first report rather than returning immediately.
+	require.Greater(t, elapsed, 400*time.Millisecond, "FindPeer returned in %s, before the grace window", elapsed)
+	require.Less(t, elapsed, 2*time.Second, "FindPeer took %s, the slow responders were not cut", elapsed)
+}
+
+// TestFindPeerDialTimeoutDisabled pins WithFindPeerDialTimeout(0): the background
+// dial is skipped entirely, so FindPeer never calls Connect for an unreachable
+// target. The reported addresses are still returned and recorded in the peerstore;
+// only the identify refinement is gone.
+func TestFindPeerDialTimeoutDisabled(t *testing.T) {
+	frt := newTestFullRT(t, WithTimeoutPerOperation(5*time.Second), WithFindPeerDialTimeout(0))
+	frt.bucketSize = 3
+	setTriePeers(t, frt, newTestResponder(t), newTestResponder(t), newTestResponder(t))
+
+	target := newTestResponder(t)
+	targetAddr, err := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/1")
+	require.NoError(t, err)
+	reported := []peer.AddrInfo{{ID: target, Addrs: []ma.Multiaddr{targetAddr}}}
+
+	frt.protoMessenger, err = dht_pb.NewProtocolMessenger(&testMessageSender{
+		sendRequest: func(_ context.Context, _ peer.ID, req *dht_pb.Message) (*dht_pb.Message, error) {
+			assert.Equal(t, dht_pb.Message_FIND_NODE, req.Type)
+			resp := dht_pb.NewMessage(req.Type, req.Key, 0)
+			resp.CloserPeers = dht_pb.RawPeerInfosToPBPeers(reported)
+			return resp, nil
+		},
+	})
+	require.NoError(t, err)
+
+	pi, err := frt.FindPeer(t.Context(), target)
+	require.NoError(t, err)
+	require.Equal(t, target, pi.ID)
+	require.Contains(t, addrStrings(pi.Addrs), targetAddr.String())
+
+	// No background dial was started, so the host never dialed the target and the
+	// only address in the peerstore is the one the query reported.
+	require.False(t, hasValidConnectedness(frt.h, target))
+	addrs := frt.h.Peerstore().Addrs(target)
+	require.Len(t, addrs, 1, "the only address must be the reported one, with no dial having run")
+}
+
+// TestFindPeerGraceDisabled pins WithFindPeerGrace(0): there is no early exit after
+// the first report, so FindPeer waits for every responder and an address known only
+// to a slow peer is still collected. The slow responder answers just under the per-op
+// timeout, which also bounds how long this test can take on a regression (the full
+// 5s per-op timeout).
+func TestFindPeerGraceDisabled(t *testing.T) {
+	frt := newTestFullRT(t, WithTimeoutPerOperation(5*time.Second), WithFindPeerGrace(0))
+
+	const numResponders = 8
+	frt.bucketSize = numResponders
+	responders := make([]peer.ID, numResponders)
+	for i := range responders {
+		responders[i] = newTestResponder(t)
+	}
+	setTriePeers(t, frt, responders...)
+
+	target := newTestResponder(t)
+	fastAddr, err := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/3")
+	require.NoError(t, err)
+	slowAddr, err := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/4")
+	require.NoError(t, err)
+
+	// responders[0] reports the target immediately; responders[1] reports a different
+	// address of the target after 3s; the rest block until the query ends. With the
+	// default grace the slow report would be dropped and only fastAddr returned.
+	frt.protoMessenger, err = dht_pb.NewProtocolMessenger(&testMessageSender{
+		sendRequest: func(ctx context.Context, p peer.ID, req *dht_pb.Message) (*dht_pb.Message, error) {
+			assert.Equal(t, dht_pb.Message_FIND_NODE, req.Type)
+			var addr ma.Multiaddr
+			switch p {
+			case responders[0]:
+				addr = fastAddr
+			case responders[1]:
+				select {
+				case <-time.After(3 * time.Second):
+					addr = slowAddr
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			default:
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			resp := dht_pb.NewMessage(req.Type, req.Key, 0)
+			resp.CloserPeers = dht_pb.RawPeerInfosToPBPeers([]peer.AddrInfo{{ID: target, Addrs: []ma.Multiaddr{addr}}})
+			return resp, nil
+		},
+	})
+	require.NoError(t, err)
+
+	pi, err := frt.FindPeer(t.Context(), target)
+	require.NoError(t, err)
+	require.Equal(t, target, pi.ID)
+	got := addrStrings(pi.Addrs)
+	require.Contains(t, got, fastAddr.String())
+	require.Contains(t, got, slowAddr.String(), "with no grace window the slow responder's address must be collected")
+}
+
+// TestFindPeerDialBound caps the background dials: more FindPeer calls than the bound,
+// all for unreachable targets whose dial takes long enough to overlap, must never start
+// more concurrent dials than the bound. The host is wrapped so that every Connect attempt
+// is recorded and held until the test ends, letting the test observe both how many dials
+// started and how many are in flight at once.
+func TestFindPeerDialBound(t *testing.T) {
+	const n = defaultMaxConcurrentFindPeerDials + 16
+
+	frt := newTestFullRT(t, WithTimeoutPerOperation(5*time.Second), WithFindPeerGrace(0))
+	frt.bucketSize = 3
+
+	targets := make([]peer.ID, n)
+	for i := range targets {
+		targets[i] = newTestResponder(t)
+	}
+	setTriePeers(t, frt, newTestResponder(t), newTestResponder(t), newTestResponder(t))
+
+	var mu sync.Mutex
+	var started, inFlight int32
+	release := make(chan struct{})
+	defer close(release)
+	stub := &recordingHost{
+		Host: frt.h,
+		connect: func(ctx context.Context, pi peer.AddrInfo) error {
+			mu.Lock()
+			started++
+			inFlight++
+			mu.Unlock()
+			<-release
+			mu.Lock()
+			inFlight--
+			mu.Unlock()
+			return nil
+		},
+	}
+	frt.h = stub
+
+	var err error
+	frt.protoMessenger, err = dht_pb.NewProtocolMessenger(&testMessageSender{
+		sendRequest: func(_ context.Context, _ peer.ID, req *dht_pb.Message) (*dht_pb.Message, error) {
+			assert.Equal(t, dht_pb.Message_FIND_NODE, req.Type)
+			resp := dht_pb.NewMessage(req.Type, req.Key, 0)
+			// Each target is reported with its own unreachable address so every call
+			// takes the "reported but not connected" path and starts a background dial.
+			for i, tgt := range targets {
+				addr, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", 1+i))
+				require.NoError(t, err)
+				resp.CloserPeers = append(resp.CloserPeers, dht_pb.RawPeerInfosToPBPeers([]peer.AddrInfo{{ID: tgt, Addrs: []ma.Multiaddr{addr}}})...)
+			}
+			return resp, nil
+		},
+	})
+	require.NoError(t, err)
+
+	var maxInFlight int32
+	stopObserving := make(chan struct{})
+	defer close(stopObserving)
+	go func() {
+		for {
+			select {
+			case <-stopObserving:
+				return
+			case <-time.After(5 * time.Millisecond):
+				mu.Lock()
+				if inFlight > maxInFlight {
+					maxInFlight = inFlight
+				}
+				mu.Unlock()
+			}
+		}
+	}()
+
+	for _, target := range targets {
+		pi, err := frt.FindPeer(t.Context(), target)
+		require.NoError(t, err)
+		require.Equal(t, target, pi.ID)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Every Connect blocks until the test ends and the FindPeer calls are sequential,
+	// so exactly the bound number of dials started: the excess were skipped, not
+	// queued (a blocking acquire would deadlock the loop above) and not leaked past
+	// the bound.
+	require.Equal(t, int32(defaultMaxConcurrentFindPeerDials), started, "dials beyond the bound must be skipped, not started")
+	require.LessOrEqual(t, maxInFlight, int32(defaultMaxConcurrentFindPeerDials), "more than the bound of background dials were in flight at once")
+}
+
+// TestFindPeerGraceCancelRace hammers the grace window under -race: many responders
+// report the target concurrently while a tiny grace fires cancelquery. The only
+// channel between the query goroutines and FindPeer's collector is addrsCh, which is
+// closed after execOnMany returns; this test exists to catch a late send racing that
+// close (a panic) or any other data race in the cancel path.
+//
+// It also pins the drain-after-cancel: responders[0] answers well before the grace
+// deadline with its own address, so its report is buffered in addrsCh before the timer
+// fires. The collector may not have consumed it by the time cancelquery() runs; the
+// drain loop must still collect it after the cancel. A report whose round-trip only
+// completes *after* the deadline is a different case and is intentionally dropped (see
+// TestFindPeerGraceDropsPostDeadlineReports).
+func TestFindPeerGraceCancelRace(t *testing.T) {
+	const iters = 30
+
+	for i := range iters {
+		frt := newTestFullRT(t, WithTimeoutPerOperation(5*time.Second), WithFindPeerGrace(200*time.Millisecond))
+		frt.bucketSize = 8
+		responders := make([]peer.ID, 8)
+		for j := range responders {
+			responders[j] = newTestResponder(t)
+		}
+		setTriePeers(t, frt, responders...)
+
+		target := newTestResponder(t)
+		baseAddr, err := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/1")
+		require.NoError(t, err)
+		earlyAddr, err := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/2")
+		require.NoError(t, err)
+
+		frt.protoMessenger, err = dht_pb.NewProtocolMessenger(&testMessageSender{
+			sendRequest: func(ctx context.Context, p peer.ID, req *dht_pb.Message) (*dht_pb.Message, error) {
+				assert.Equal(t, dht_pb.Message_FIND_NODE, req.Type)
+				idx := 0
+				for k, r := range responders {
+					if r == p {
+						idx = k
+						break
+					}
+				}
+				// Every responder reports the target. responders[0] answers early with
+				// its own address: it opens the grace window and its report is buffered
+				// before the deadline, so it must survive the cancel. The rest answer at
+				// a delay that can land on either side of the grace window; whichever
+				// side they land on, their baseAddr report is already covered by
+				// responders[0].
+				var addr ma.Multiaddr = baseAddr
+				if idx == 0 {
+					select {
+					case <-time.After(20 * time.Millisecond):
+						addr = earlyAddr
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				} else {
+					delay := time.Duration((i+idx)%7)*50*time.Millisecond
+					select {
+					case <-time.After(delay):
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				}
+				resp := dht_pb.NewMessage(req.Type, req.Key, 0)
+				resp.CloserPeers = dht_pb.RawPeerInfosToPBPeers([]peer.AddrInfo{{ID: target, Addrs: []ma.Multiaddr{addr}}})
+				return resp, nil
+			},
+		})
+		require.NoError(t, err)
+
+		pi, err := frt.FindPeer(t.Context(), target)
+		require.NoError(t, err)
+		require.Equal(t, target, pi.ID)
+		got := addrStrings(pi.Addrs)
+		require.Contains(t, got, baseAddr.String())
+		require.Contains(t, got, earlyAddr.String(), "a report buffered before the grace deadline must survive the cancel")
+	}
+}
+
+// TestFindPeerGraceDropsPostDeadlineReports pins the other side of the grace window:
+// a responder that answers after the deadline is cut off. Its send blocks on the full
+// channel until cancelquery() unblocks it, then takes ctx.Done() and abandons the
+// report, so its unique address must NOT be in the result. The len(peers) buffer makes
+// this deterministic: with a smaller buffer the blocked sender could win the race to
+// the collector instead of losing to the cancel.
+func TestFindPeerGraceDropsPostDeadlineReports(t *testing.T) {
+	const grace = 200 * time.Millisecond
+
+	frt := newTestFullRT(t, WithTimeoutPerOperation(5*time.Second), WithFindPeerGrace(grace))
+	frt.bucketSize = 8
+
+	responders := make([]peer.ID, 8)
+	for j := range responders {
+		responders[j] = newTestResponder(t)
+	}
+	setTriePeers(t, frt, responders...)
+
+	target := newTestResponder(t)
+	baseAddr, err := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/1")
+	require.NoError(t, err)
+	slowAddr, err := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/2")
+	require.NoError(t, err)
+
+	var firstReported atomic.Bool
+	frt.protoMessenger, err = dht_pb.NewProtocolMessenger(&testMessageSender{
+		sendRequest: func(ctx context.Context, p peer.ID, req *dht_pb.Message) (*dht_pb.Message, error) {
+			assert.Equal(t, dht_pb.Message_FIND_NODE, req.Type)
+			idx := 0
+			for k, r := range responders {
+				if r == p {
+					idx = k
+					break
+				}
+			}
+			var addr ma.Multiaddr = baseAddr
+			switch idx {
+			case 0:
+				// The first responder answers immediately, opening the grace window.
+				firstReported.Store(true)
+			case 1:
+				// The second responder waits for the first report, then sleeps well past
+				// the grace deadline. By the time it tries to send, cancelquery() has
+				// already fired and its ctx is done, so the send takes ctx.Done() and
+				// the report is dropped.
+				for !firstReported.Load() {
+					select {
+					case <-time.After(1 * time.Millisecond):
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				}
+				select {
+				case <-time.After(grace + 50*time.Millisecond):
+					addr = slowAddr
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			default:
+				delay := time.Duration(idx) * 10 * time.Millisecond
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			resp := dht_pb.NewMessage(req.Type, req.Key, 0)
+			resp.CloserPeers = dht_pb.RawPeerInfosToPBPeers([]peer.AddrInfo{{ID: target, Addrs: []ma.Multiaddr{addr}}})
+			return resp, nil
+		},
+	})
+	require.NoError(t, err)
+
+	pi, err := frt.FindPeer(t.Context(), target)
+	require.NoError(t, err)
+	require.Equal(t, target, pi.ID)
+	got := addrStrings(pi.Addrs)
+	require.Contains(t, got, baseAddr.String())
+	require.NotContains(t, got, slowAddr.String(), "a report that lands after the grace deadline must be dropped")
+}
+
+// TestFindPeerDialOutlivesCallerContext pins that the background dial is parented to
+// the DHT's own context rather than the request context: cancelling the caller's
+// context after FindPeer returns must not cancel the in-flight dial. A regression back
+// to context.WithTimeout(ctx, ...) would make Connect return immediately with a
+// cancellation error and this test would fail.
+func TestFindPeerDialOutlivesCallerContext(t *testing.T) {
+	frt := newTestFullRT(t, WithTimeoutPerOperation(5*time.Second), WithFindPeerGrace(0))
+	frt.bucketSize = 3
+	setTriePeers(t, frt, newTestResponder(t), newTestResponder(t), newTestResponder(t))
+
+	target := newTestResponder(t)
+	targetAddr, err := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/1")
+	require.NoError(t, err)
+	reported := []peer.AddrInfo{{ID: target, Addrs: []ma.Multiaddr{targetAddr}}}
+
+	frt.protoMessenger, err = dht_pb.NewProtocolMessenger(&testMessageSender{
+		sendRequest: func(_ context.Context, _ peer.ID, req *dht_pb.Message) (*dht_pb.Message, error) {
+			assert.Equal(t, dht_pb.Message_FIND_NODE, req.Type)
+			resp := dht_pb.NewMessage(req.Type, req.Key, 0)
+			resp.CloserPeers = dht_pb.RawPeerInfosToPBPeers(reported)
+			return resp, nil
+		},
+	})
+	require.NoError(t, err)
+
+	dialStarted := make(chan struct{})
+	var dialRanToCompletion atomic.Bool
+	stub := &recordingHost{
+		Host: frt.h,
+		connect: func(ctx context.Context, pi peer.AddrInfo) error {
+			close(dialStarted)
+			// Hold the dial well past the caller's cancellation below. If the dial's
+			// context were derived from the request context, it would be done by now and
+			// this select would take the ctx.Done() branch.
+			select {
+			case <-time.After(200 * time.Millisecond):
+				dialRanToCompletion.Store(true)
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	}
+	frt.h = stub
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	pi, err := frt.FindPeer(ctx, target)
+	require.NoError(t, err)
+	require.Equal(t, target, pi.ID)
+
+	// The dial must have started before FindPeer returned.
+	select {
+	case <-dialStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the background dial did not start")
+	}
+
+	// Cancel the caller's context while the dial is still in flight.
+	cancel()
+
+	require.Eventually(t, func() bool { return dialRanToCompletion.Load() }, 2*time.Second, 10*time.Millisecond,
+		"the background dial must run to completion after the caller's context is cancelled")
+}
+
+// TestFindPeerSelfReturnsNotFound pins that FindPeer for the DHT's own ID reports
+// not-found rather than success with an empty AddrInfo: maybeAddAddrs declines to store
+// addresses for self, so without the guard the final PeerInfo lookup would return an
+// empty answer.
+func TestFindPeerSelfReturnsNotFound(t *testing.T) {
+	frt := newTestFullRT(t, WithTimeoutPerOperation(5*time.Second), WithFindPeerGrace(0))
+	frt.bucketSize = 3
+	setTriePeers(t, frt, newTestResponder(t), newTestResponder(t), newTestResponder(t))
+
+	selfAddr, err := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/5")
+	require.NoError(t, err)
+
+	frt.protoMessenger, err = dht_pb.NewProtocolMessenger(&testMessageSender{
+		sendRequest: func(_ context.Context, _ peer.ID, req *dht_pb.Message) (*dht_pb.Message, error) {
+			assert.Equal(t, dht_pb.Message_FIND_NODE, req.Type)
+			resp := dht_pb.NewMessage(req.Type, req.Key, 0)
+			resp.CloserPeers = dht_pb.RawPeerInfosToPBPeers([]peer.AddrInfo{{ID: frt.h.ID(), Addrs: []ma.Multiaddr{selfAddr}}})
+			return resp, nil
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = frt.FindPeer(t.Context(), frt.h.ID())
+	require.ErrorIs(t, err, routing.ErrNotFound)
+}
+
+// TestFindPeerCallerCancelledSurfacesError pins that a caller context cancelled
+// mid-query is surfaced as an error rather than presented as a successful lookup with
+// whatever partial addresses happened to be collected, and that no background dial
+// starts for a result nobody will read.
+func TestFindPeerCallerCancelledSurfacesError(t *testing.T) {
+	frt := newTestFullRT(t, WithTimeoutPerOperation(5*time.Second), WithFindPeerGrace(0))
+	frt.bucketSize = 3
+	setTriePeers(t, frt, newTestResponder(t), newTestResponder(t), newTestResponder(t))
+
+	target := newTestResponder(t)
+	targetAddr, err := ma.NewMultiaddr("/ip4/127.0.0.1/tcp/6")
+	require.NoError(t, err)
+	reported := []peer.AddrInfo{{ID: target, Addrs: []ma.Multiaddr{targetAddr}}}
+
+	responders := make([]peer.ID, 3)
+	for i := range responders {
+		responders[i] = newTestResponder(t)
+	}
+	setTriePeers(t, frt, responders...)
+
+	var connectCalls atomic.Int32
+	stub := &recordingHost{
+		Host: frt.h,
+		connect: func(context.Context, peer.AddrInfo) error {
+			connectCalls.Add(1)
+			return nil
+		},
+	}
+	frt.h = stub
+
+	// responders[0] reports the target immediately; the rest block until the query
+	// context is cancelled. That way the caller's cancellation lands after a report
+	// has been collected (partial addresses would be available) but while the query
+	// is still running.
+	frt.protoMessenger, err = dht_pb.NewProtocolMessenger(&testMessageSender{
+		sendRequest: func(ctx context.Context, p peer.ID, req *dht_pb.Message) (*dht_pb.Message, error) {
+			assert.Equal(t, dht_pb.Message_FIND_NODE, req.Type)
+			if p != responders[0] {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			resp := dht_pb.NewMessage(req.Type, req.Key, 0)
+			resp.CloserPeers = dht_pb.RawPeerInfosToPBPeers(reported)
+			return resp, nil
+		},
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() {
+		// Let the query report the target (so partial addresses would be available),
+		// then cancel the caller's context before FindPeer returns.
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err = frt.FindPeer(ctx, target)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Zero(t, connectCalls.Load(), "no background dial may start for a cancelled caller")
+}
+
+// recordingHost wraps a host and overrides Connect so a test can record dial
+// attempts. All other methods are passed through to the wrapped host, including
+// Peerstore: the background dials must see the real peerstore, since FindPeer
+// records the reported addresses there before dialing.
+type recordingHost struct {
+	host.Host
+	connect func(ctx context.Context, pi peer.AddrInfo) error
+}
+
+var _ host.Host = (*recordingHost)(nil)
+
+func (h *recordingHost) Connect(ctx context.Context, pi peer.AddrInfo) error {
+	return h.connect(ctx, pi)
 }

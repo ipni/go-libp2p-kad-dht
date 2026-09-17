@@ -118,6 +118,26 @@ type FullRT struct {
 	waitFrac     float64
 	timeoutPerOp time.Duration
 
+	// findPeerGrace is how long FindPeer keeps querying after the first peer reports
+	// the target, before cancelling the query to cut off slow peers. Zero disables
+	// the early exit: FindPeer waits for the full query. See
+	// defaultFindPeerGraceAfterFirstReport and WithFindPeerGrace.
+	findPeerGrace time.Duration
+	// findPeerDialTimeout is the budget for the background dial FindPeer starts once
+	// the query has reported the target's addresses. Zero disables the dial entirely.
+	// See defaultFindPeerDialTimeout and WithFindPeerDialTimeout.
+	findPeerDialTimeout time.Duration
+	// maxConcurrentFindPeerDials bounds the number of in-flight background FindPeer
+	// dials. See defaultMaxConcurrentFindPeerDials and WithMaxConcurrentFindPeerDials.
+	maxConcurrentFindPeerDials int
+	// findPeerDialSlots implements that bound. It is acquired (non-blocking) before a
+	// dial starts and released when it finishes; see dialFindPeerTarget.
+	findPeerDialSlots chan struct{}
+	// findPeerDialWG tracks the in-flight background FindPeer dials so Close can wait
+	// for them to unwind. It is separate from wg: adding to wg after cancel() would
+	// race its Wait in Close.
+	findPeerDialWG sync.WaitGroup
+
 	bulkSendParallelism int
 
 	self peer.ID
@@ -149,6 +169,9 @@ func NewFullRT(h host.Host, protocolPrefix protocol.ID, options ...Option) (*Ful
 		waitFrac:               0.3,
 		timeoutPerOp:           5 * time.Second,
 		ipDiversityFilterLimit: amino.DefaultMaxPeersPerIPGroup,
+		findPeerGrace:                defaultFindPeerGraceAfterFirstReport,
+		findPeerDialTimeout:          defaultFindPeerDialTimeout,
+		maxConcurrentFindPeerDials:   defaultMaxConcurrentFindPeerDials,
 	}
 	if err := fullrtcfg.apply(options...); err != nil {
 		return nil, err
@@ -253,6 +276,11 @@ func NewFullRT(h host.Host, protocolPrefix protocol.ID, options ...Option) (*Ful
 
 		waitFrac:     fullrtcfg.waitFrac,
 		timeoutPerOp: fullrtcfg.timeoutPerOp,
+
+		findPeerGrace:                fullrtcfg.findPeerGrace,
+		findPeerDialTimeout:          fullrtcfg.findPeerDialTimeout,
+		maxConcurrentFindPeerDials:   fullrtcfg.maxConcurrentFindPeerDials,
+		findPeerDialSlots:            make(chan struct{}, fullrtcfg.maxConcurrentFindPeerDials),
 
 		crawlerInterval: fullrtcfg.crawlInterval,
 
@@ -425,6 +453,12 @@ func (dht *FullRT) runCrawler(ctx context.Context) {
 func (dht *FullRT) Close() error {
 	dht.cancel()
 	dht.wg.Wait()
+
+	// Wait for in-flight background FindPeer dials to unwind. cancel() has already
+	// fired, so each dial's context is done and Connect returns promptly; waiting
+	// here makes Close deterministic (no goroutine left calling into the host after
+	// it returns).
+	dht.findPeerDialWG.Wait()
 
 	// A disabled subsystem has no store, so only close the ones constructed.
 	var errs []error
@@ -1495,10 +1529,29 @@ func (dht *FullRT) findProvidersAsyncRoutine(ctx context.Context, key multihash.
 	dht.execOnMany(queryctx, fn, peers, false)
 }
 
-// findPeerDialTimeout is the budget for the background dial that FindPeer starts once
-// the query has reported the target's addresses. It only refines those addresses for
-// later callers; it does not gate the answer.
-const findPeerDialTimeout = 5 * time.Second
+// defaultFindPeerDialTimeout is the budget for the background dial that FindPeer starts
+// once the query has reported the target's addresses. It only refines those addresses for
+// later callers; it does not gate the answer. WithFindPeerDialTimeout overrides it, with
+// 0 disabling the dial entirely.
+const defaultFindPeerDialTimeout = 5 * time.Second
+
+// defaultFindPeerGraceAfterFirstReport is how long FindPeer keeps querying after the first
+// peer reports the target. Peers close to the target usually answer at nearly the same
+// time, so a short grace collects the near-simultaneous duplicates and alternates other
+// peers report before the remaining slow peers are cut. The trade-off: an address known
+// only to a peer that answers more than this long after the first is dropped, but such
+// reports were rarely different from the first. WithFindPeerGrace overrides it, with 0
+// disabling the early exit and waiting for the full query.
+const defaultFindPeerGraceAfterFirstReport = 500 * time.Millisecond
+
+// defaultMaxConcurrentFindPeerDials bounds how many background FindPeer dials may run
+// at once. The dial is a pure side effect on the peerstore, so when the bound is reached
+// a new dial is skipped rather than queued: the answer has already been returned and
+// nothing waits on the dial. 64 keeps a storm of FindPeer calls (on the order of 100 per
+// second on a busy router, most for unreachable targets) from piling hundreds of dials
+// onto the swarm's dial limiter and resource manager at once and competing with the dials
+// the DHT queries themselves need. WithMaxConcurrentFindPeerDials overrides it.
+const defaultMaxConcurrentFindPeerDials = 64
 
 // FindPeer searches for a peer with given ID.
 func (dht *FullRT) FindPeer(ctx context.Context, id peer.ID) (pi peer.AddrInfo, err error) {
@@ -1524,17 +1577,38 @@ func (dht *FullRT) FindPeer(ctx context.Context, id peer.ID) (pi peer.AddrInfo, 
 	queryctx, cancelquery := context.WithCancel(ctx)
 	defer cancelquery()
 
-	addrsCh := make(chan *peer.AddrInfo, 1)
+	// Sized for every queried peer so a report is never dropped because the
+	// collector has not yet reached it: each responder sends at most one report,
+	// and the collector drains the channel until it closes.
+	addrsCh := make(chan *peer.AddrInfo, len(peers))
 	newAddrs := make([]ma.Multiaddr, 0)
 
 	wg := sync.WaitGroup{}
 	wg.Go(func() {
 		addrsSoFar := make(map[string]struct{})
+		var graceTimer *time.Timer
+		var graceChan <-chan time.Time
+		defer func() {
+			if graceTimer != nil {
+				graceTimer.Stop()
+			}
+		}()
 		for {
 			select {
 			case ai, ok := <-addrsCh:
 				if !ok {
 					return
+				}
+
+				// The first report of the target opens a grace window. Close enough
+				// peers usually answer at nearly the same time, so briefly wait to
+				// collect the near-simultaneous duplicates and alternates they report,
+				// then cancel the query to cut off the peers that are still slow. With
+				// findPeerGrace set to 0 there is no early exit: the query runs to its
+				// normal completion and every responder's report is collected.
+				if graceTimer == nil && dht.findPeerGrace > 0 {
+					graceTimer = time.NewTimer(dht.findPeerGrace)
+					graceChan = graceTimer.C
 				}
 
 				for _, a := range ai.Addrs {
@@ -1544,6 +1618,18 @@ func (dht *FullRT) FindPeer(ctx context.Context, id peer.ID) (pi peer.AddrInfo, 
 						addrsSoFar[string(a.Bytes())] = struct{}{}
 					}
 				}
+			case <-graceChan:
+				// The grace window elapsed after the first report. Cancel the query so
+				// execOnMany stops waiting on the slow peers (cancelled calls count as
+				// done), then keep draining addrsCh until it closes: a report that beat
+				// the deadline by an instant — already buffered, or in flight from a
+				// responder unblocked by the cancel — is still collected. execOnMany
+				// returns as soon as the cancelled calls complete and closes addrsCh
+				// right after, so this adds no latency. A report that lands after the
+				// deadline is dropped: its sender blocks on the full channel until the
+				// cancel unblocks it, then takes ctx.Done() and abandons the send.
+				cancelquery()
+				graceChan = nil
 			case <-ctx.Done():
 				return
 			}
@@ -1606,22 +1692,74 @@ func (dht *FullRT) FindPeer(ctx context.Context, id peer.ID) (pi peer.AddrInfo, 
 	// rather than discarding the addresses because the dial could not succeed, so
 	// callers that switch to this accelerated client do not silently lose answers the
 	// standard client would have returned.
+	//
+	// The trade-off: the old code dialed before this point, so a reachable target we
+	// were not yet connected to answered from the post-identify peerstore (observed
+	// and certified addresses). Now every not-yet-connected target — reachable or
+	// not — answers from the set the DHT just reported, which peers cache and which
+	// can be stale. A caller that gets a stale address simply fails to dial and
+	// retries; there is no way to tell reachable from unreachable without paying the
+	// dial timeout this change removes.
 	dht.maybeAddAddrs(id, newAddrs, peerstore.TempAddrTTL)
+
+	// The caller went away mid-query: surface the cancellation rather than presenting
+	// a partial result as a successful lookup, and do not spend a dial slot on an
+	// answer nobody will read.
+	if err := ctx.Err(); err != nil {
+		return peer.AddrInfo{}, err
+	}
 
 	// Dial in the background so identify can refine these addresses for later
 	// callers. This is purely a side effect on the peerstore: the dial no longer
 	// gates the answer, so a NATed or offline target no longer costs a full
 	// findPeerDialTimeout of latency before a correct answer is returned.
+	dht.dialFindPeerTarget(id, newAddrs)
+
+	pi = dht.h.Peerstore().PeerInfo(id)
+	if len(pi.Addrs) == 0 {
+		// maybeAddAddrs declined to store (e.g. the target is ourselves), or the
+		// peerstore holds nothing: no usable answer, so report not-found rather than
+		// an empty AddrInfo.
+		return peer.AddrInfo{}, routing.ErrNotFound
+	}
+	return pi, nil
+}
+
+// dialFindPeerTarget starts the background dial that refines the addresses a FindPeer
+// query reported for an unreachable target. It skips the dial rather than queueing it
+// when maxConcurrentFindPeerDials are already in flight, because the answer has already
+// been returned and nothing waits on this dial: skipping only loses the address
+// refinement for later callers, which the peerstore will re-learn from the next report.
+func (dht *FullRT) dialFindPeerTarget(id peer.ID, addrs []ma.Multiaddr) {
+	if dht.findPeerDialTimeout <= 0 {
+		return
+	}
+
+	select {
+	case dht.findPeerDialSlots <- struct{}{}:
+	default:
+		// A storm of FindPeer calls has filled the bound. Skip this dial; the
+		// reported addresses are already in the peerstore, so later callers can
+		// still use them even without identify refining them.
+		logger.Debugw("skipping background FindPeer dial, bound reached", "peer", id, "bound", dht.maxConcurrentFindPeerDials)
+		return
+	}
+
+	dht.findPeerDialWG.Add(1)
 	go func() {
-		connctx, cancelconn := context.WithTimeout(dht.ctx, findPeerDialTimeout)
+		defer dht.findPeerDialWG.Done()
+		defer func() { <-dht.findPeerDialSlots }()
+		// The swarm's dialSync (go-libp2p p2p/net/swarm/dial_sync.go) already ensures
+		// at most one active dial per peer: a concurrent Connect for the same target
+		// ref-counts and joins the in-flight dial instead of starting a second one, so
+		// no extra deduplication is needed here.
+		connctx, cancelconn := context.WithTimeout(dht.ctx, dht.findPeerDialTimeout)
 		defer cancelconn()
 		_ = dht.h.Connect(connctx, peer.AddrInfo{
 			ID:    id,
-			Addrs: newAddrs,
+			Addrs: addrs,
 		})
 	}()
-
-	return dht.h.Peerstore().PeerInfo(id), nil
 }
 
 var _ routing.Routing = (*FullRT)(nil)

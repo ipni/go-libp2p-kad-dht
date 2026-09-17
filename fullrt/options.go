@@ -18,7 +18,10 @@ type config struct {
 	timeoutPerOp           time.Duration
 	crawler                crawler.Crawler
 	pmOpts                 []records.Option
-	ipDiversityFilterLimit int
+	ipDiversityFilterLimit     int
+	findPeerGrace              time.Duration
+	findPeerDialTimeout        time.Duration
+	maxConcurrentFindPeerDials int
 }
 
 func (cfg *config) apply(opts ...Option) error {
@@ -107,6 +110,51 @@ func WithProviderManagerOptions(pmOpts ...records.Option) Option {
 func WithIPDiversityFilterLimit(ipDiversityFilterLimit int) Option {
 	return func(opt *config) error {
 		opt.ipDiversityFilterLimit = ipDiversityFilterLimit
+		return nil
+	}
+}
+
+// WithFindPeerGrace sets how long FindPeer keeps querying after the first peer
+// reports the target, before cancelling the query to cut off the peers that are
+// still slow. Defaults to 500 milliseconds if unspecified. A value of 0 disables
+// the early exit: FindPeer waits for the full query and collects every
+// responder's report.
+func WithFindPeerGrace(d time.Duration) Option {
+	return func(opt *config) error {
+		if d < 0 {
+			return fmt.Errorf("find peer grace must not be negative; got: %s", d)
+		}
+		opt.findPeerGrace = d
+		return nil
+	}
+}
+
+// WithFindPeerDialTimeout sets the budget for the background dial that FindPeer
+// starts once the query has reported the target's addresses. The dial refines
+// those addresses in the peerstore for later callers but does not gate the
+// answer. Defaults to 5 seconds if unspecified. A value of 0 disables the
+// background dial entirely.
+func WithFindPeerDialTimeout(d time.Duration) Option {
+	return func(opt *config) error {
+		if d < 0 {
+			return fmt.Errorf("find peer dial timeout must not be negative; got: %s", d)
+		}
+		opt.findPeerDialTimeout = d
+		return nil
+	}
+}
+
+// WithMaxConcurrentFindPeerDials sets the bound on how many background FindPeer
+// dials may run at once. When the bound is reached a new dial is skipped rather
+// than queued: the answer has already been returned and nothing waits on the
+// dial, so skipping only defers address refinement until the next report.
+// Defaults to 64 if unspecified. Must be at least 1.
+func WithMaxConcurrentFindPeerDials(n int) Option {
+	return func(opt *config) error {
+		if n < 1 {
+			return fmt.Errorf("max concurrent find peer dials must be at least 1; got: %d", n)
+		}
+		opt.maxConcurrentFindPeerDials = n
 		return nil
 	}
 }

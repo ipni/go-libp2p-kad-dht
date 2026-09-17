@@ -22,6 +22,7 @@ type config struct {
 	findPeerGrace              time.Duration
 	findPeerDialTimeout        time.Duration
 	maxConcurrentFindPeerDials int
+	routeTableFilter           kaddht.RouteTableFilterFunc
 }
 
 func (cfg *config) apply(opts ...Option) error {
@@ -155,6 +156,28 @@ func WithMaxConcurrentFindPeerDials(n int) Option {
 			return fmt.Errorf("max concurrent find peer dials must be at least 1; got: %d", n)
 		}
 		opt.maxConcurrentFindPeerDials = n
+		return nil
+	}
+}
+
+// WithRouteTableFilter sets the filter fullrt applies to every peer the crawler
+// reports, before that peer enters the routing table.
+//
+// The default, kaddht.PublicRoutingTableFilter, keeps a peer only while the host
+// has an open connection to it. That holds for a crawler that has just dialled
+// the peer itself, but a crawler which reports peers it did not dial - one
+// replaying a persisted routing table, say - can never satisfy it, and every
+// peer it reports is dropped.
+//
+// The filter receives the *FullRT as its first argument, so a custom filter can
+// delegate to kaddht.PublicRoutingTableFilter and widen it rather than replace
+// it. Returning true for everything trusts the crawler completely.
+func WithRouteTableFilter(f kaddht.RouteTableFilterFunc) Option {
+	return func(opt *config) error {
+		if f == nil {
+			return fmt.Errorf("route table filter must not be nil")
+		}
+		opt.routeTableFilter = f
 		return nil
 	}
 }

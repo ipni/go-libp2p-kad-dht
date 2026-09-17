@@ -1495,6 +1495,11 @@ func (dht *FullRT) findProvidersAsyncRoutine(ctx context.Context, key multihash.
 	dht.execOnMany(queryctx, fn, peers, false)
 }
 
+// findPeerDialTimeout is the budget for the background dial that FindPeer starts once
+// the query has reported the target's addresses. It only refines those addresses for
+// later callers; it does not gate the answer.
+const findPeerDialTimeout = 5 * time.Second
+
 // FindPeer searches for a peer with given ID.
 func (dht *FullRT) FindPeer(ctx context.Context, id peer.ID) (pi peer.AddrInfo, err error) {
 	ctx, end := tracer.FindPeer(dhtName, ctx, id)
@@ -1583,22 +1588,40 @@ func (dht *FullRT) FindPeer(ctx context.Context, id peer.ID) (pi peer.AddrInfo, 
 	close(addrsCh)
 	wg.Wait()
 
-	if len(newAddrs) > 0 {
-		connctx, cancelconn := context.WithTimeout(ctx, time.Second*5)
+	// We are (or recently were) connected to the target, so we already hold the best
+	// addresses for it.
+	if hasValidConnectedness(dht.h, id) {
+		return dht.h.Peerstore().PeerInfo(id), nil
+	}
+
+	if len(newAddrs) == 0 {
+		return peer.AddrInfo{}, routing.ErrNotFound
+	}
+
+	// The query reported the target's addresses but we are not connected to it. The
+	// standard client, IpfsDHT.FindPeer (see routing.go's dialedPeerDuringQuery),
+	// returns a peer's addresses whenever the query dialed it, even when that dial
+	// failed: a NATed or offline peer cannot complete the dial, yet the addresses the
+	// network just reported are still a correct, useful answer. Match that behaviour
+	// rather than discarding the addresses because the dial could not succeed, so
+	// callers that switch to this accelerated client do not silently lose answers the
+	// standard client would have returned.
+	dht.maybeAddAddrs(id, newAddrs, peerstore.TempAddrTTL)
+
+	// Dial in the background so identify can refine these addresses for later
+	// callers. This is purely a side effect on the peerstore: the dial no longer
+	// gates the answer, so a NATed or offline target no longer costs a full
+	// findPeerDialTimeout of latency before a correct answer is returned.
+	go func() {
+		connctx, cancelconn := context.WithTimeout(dht.ctx, findPeerDialTimeout)
 		defer cancelconn()
 		_ = dht.h.Connect(connctx, peer.AddrInfo{
 			ID:    id,
 			Addrs: newAddrs,
 		})
-	}
+	}()
 
-	// Return peer information if we tried to dial the peer during the query or we are (or recently were) connected
-	// to the peer.
-	if hasValidConnectedness(dht.h, id) {
-		return dht.h.Peerstore().PeerInfo(id), nil
-	}
-
-	return peer.AddrInfo{}, routing.ErrNotFound
+	return dht.h.Peerstore().PeerInfo(id), nil
 }
 
 var _ routing.Routing = (*FullRT)(nil)
